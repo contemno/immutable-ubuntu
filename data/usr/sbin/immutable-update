@@ -1,0 +1,271 @@
+#!/bin/bash 
+# /usr/sbin/immutable-update
+# Immutable root change script: stage updates in a btrfs snapshot via nspawn.
+set -euo pipefail
+
+INTERACTIVE=0
+GUI=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --shell|-i) INTERACTIVE=1 ;;
+        --gui)      INTERACTIVE=1; GUI=1 ;;
+    esac
+done
+
+CONF="/etc/immutable-update.conf"
+if [[ ! -f "$CONF" ]]; then
+    echo "ERROR: config not found at $CONF" >&2
+    exit 1
+fi
+# shellcheck source=/etc/immutable-update.conf
+source "$CONF"
+
+# ── Globals ──────────────────────────────────────────────────────────
+TOPLEVEL="/run/immutable-update/btrfs-toplevel"
+STAMP="root.$(date +%Y%m%dT%H%M%S)"
+LOCKFILE="/run/immutable-update.lock"
+LOG_FILE="${LOG_DIR}/update-${STAMP}.log"
+
+# ── Helpers ──────────────────────────────────────────────────────────
+die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
+info() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+warn() { echo "[$(date +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
+
+cleanup() {
+    local rc=$?
+    # Unmount staging bind mounts if still up
+    mountpoint -q "${TOPLEVEL}/${STAGING_SUBVOL}${BOOT_PARTITION}" 2>/dev/null && \
+        umount -R "${TOPLEVEL}/${STAGING_SUBVOL}${BOOT_PARTITION}"
+    mountpoint -q "$TOPLEVEL" 2>/dev/null && umount -l "$TOPLEVEL"
+    rm -f "$LOCKFILE"
+    if [[ $rc -ne 0 ]]; then
+        info "Update FAILED (exit $rc). Staging subvolume retained for investigation."
+        info "  Inspect via: mount -o subvolid=5 <dev> /mnt && ls /mnt/${STAGING_SUBVOL}"
+    fi
+    exit $rc
+}
+trap cleanup EXIT
+
+# ── Sanity checks ────────────────────────────────────────────────────
+[[ $(id -u) -eq 0 ]] || die "must be run as root"
+
+# Acquire an exclusive lock so timer and manual runs don't collide
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "Another immutable-update is already running. Exiting." >&2
+    exit 0
+fi
+
+mkdir -p "$LOG_DIR"
+info "=== immutable-update started ==="
+
+# ── Resolve the btrfs device backing root ────────────────────────────
+resolve_btrfs_device() {
+    local dev
+    dev=$(findmnt -n -o SOURCE / | head -1)
+    # Strip subvol path if present (e.g. /dev/mapper/crypt[@rootfs])
+    dev="${dev%%\[*}"
+    if [[ -z "$dev" ]]; then
+        die "cannot determine btrfs device for /"
+    fi
+    echo "$dev"
+}
+BTRFS_DEV=$(resolve_btrfs_device)
+info "BTRFS device: $BTRFS_DEV"
+
+# ── Mount top-level btrfs volume ─────────────────────────────────────
+mkdir -p "$TOPLEVEL"
+mount -t btrfs -o subvolid=5 "$BTRFS_DEV" "$TOPLEVEL" || die "failed to mount top-level"
+info "top-level mounted at $TOPLEVEL"
+
+SNAP_PATH="${TOPLEVEL}/${SNAPSHOTS_DIR}"
+STAGING_PATH="${TOPLEVEL}/${STAGING_SUBVOL}"
+
+# ── Find latest read-only snapshot ───────────────────────────────────
+if [[ ! -d "$SNAP_PATH" ]]; then
+    die "snapshots directory not found at ${SNAP_PATH}"
+fi
+
+LATEST=""
+for d in "${SNAP_PATH}"/*/; do
+    [[ -d "$d" ]] || continue
+    # Verify it is a read-only btrfs subvolume
+    if btrfs property get "$d" ro 2>/dev/null | grep -q 'ro=true'; then
+        LATEST="$d"
+    fi
+done
+LATEST="${LATEST%/}"   # strip trailing slash
+
+if [[ -z "$LATEST" ]]; then
+    # No snapshots yet: create the initial one from the root subvolume
+    info "no snapshots found — creating initial snapshot from ${ROOT_SUBVOL}"
+    btrfs subvolume snapshot -r "${TOPLEVEL}/${ROOT_SUBVOL}" \
+        "${SNAP_PATH}/${STAMP}" || die "failed to create initial snapshot"
+    LATEST="${SNAP_PATH}/${STAMP}"
+    info "initial snapshot created: $LATEST"
+fi
+info "latest snapshot: $LATEST"
+
+# ── Clean up any leftover staging subvolume ──────────────────────────
+if btrfs subvolume show "$STAGING_PATH" &>/dev/null; then
+    warn "stale staging subvolume found — deleting"
+    btrfs subvolume delete "$STAGING_PATH" || die "cannot delete stale staging"
+fi
+
+# ── Create writable staging clone ────────────────────────────────────
+info "creating staging subvolume from snapshot"
+btrfs subvolume snapshot "$LATEST" "$STAGING_PATH" || die "failed to create staging snapshot"
+
+# ── Prepare bind mounts for boot/EFI inside staging ─────────────────
+mkdir -p "${STAGING_PATH}${BOOT_PARTITION}"
+mount --bind "$BOOT_PARTITION" "${STAGING_PATH}${BOOT_PARTITION}" \
+    || die "failed to bind-mount $BOOT_PARTITION"
+
+if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
+    mkdir -p "${STAGING_PATH}${EFI_PARTITION}"
+    mount --bind "$EFI_PARTITION" "${STAGING_PATH}${EFI_PARTITION}" \
+        || die "failed to bind-mount $EFI_PARTITION"
+fi
+
+# ── Run updates inside nspawn container ──────────────────────────────
+NSPAWN_RC=0
+
+if [[ $INTERACTIVE -eq 1 ]]; then
+    info "entering interactive nspawn shell — exit 0 to snapshot, non-zero to abort"
+
+    NSPAWN_ARGS=(
+        --directory="$STAGING_PATH"
+        --resolv-conf=bind-stub
+        --setenv=DEBIAN_FRONTEND=noninteractive
+        --console=interactive
+    )
+
+    if [[ $GUI -eq 1 ]]; then
+        # Detect the calling user's UID (works through sudo)
+        CALLER_UID="${SUDO_UID:-1000}"
+        XDG_DIR="/run/user/${CALLER_UID}"
+
+        NSPAWN_ARGS+=(
+            --bind=/dev/dri
+            --bind=/tmp/.X11-unix
+            --property=DeviceAllow=/dev/dri/card0
+            --property=DeviceAllow=/dev/dri/renderD128
+        )
+
+        # Bind Wayland/PipeWire/PulseAudio sockets if available
+        [[ -d "$XDG_DIR" ]] && NSPAWN_ARGS+=(--bind="$XDG_DIR")
+
+        NSPAWN_ARGS+=(
+            --setenv=DISPLAY="${DISPLAY:-:0}"
+            --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+            --setenv=XDG_RUNTIME_DIR="$XDG_DIR"
+        )
+
+        # Pass through DBUS session bus if available
+        DBUS_SOCK="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_DIR}/bus}"
+        NSPAWN_ARGS+=(--setenv=DBUS_SESSION_BUS_ADDRESS="$DBUS_SOCK")
+
+        info "GUI passthrough enabled (display, GPU, audio sockets)"
+    fi
+
+    systemd-nspawn "${NSPAWN_ARGS[@]}" \
+        /bin/bash --norc --noprofile -c 'set +u; exec bash -l' || NSPAWN_RC=$?
+else
+    # Serialize REPOS array for passing into nspawn
+    REPOS_JOINED=""
+    for _repo in "${REPOS[@]}"; do
+        [[ -n "$_repo" ]] && REPOS_JOINED+="${_repo}"$'\n'
+    done
+
+    info "entering nspawn container for updates"
+    systemd-nspawn \
+        --directory="$STAGING_PATH" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        --setenv=_IMMUTABLE_REPOS="$REPOS_JOINED" \
+        --quiet \
+        --console=pipe \
+        /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || NSPAWN_RC=${PIPESTATUS[0]}
+
+# ── System updates ──────────────────────────────────────────────────
+apt-get update
+apt-get full-upgrade -y
+apt-get autoremove -y
+
+# ── Run post-update scripts ─────────────────────────────────────────
+while IFS= read -r repo; do
+    [[ -z "$repo" ]] && continue
+    echo "==> Cloning $repo"
+    work=$(mktemp -d /tmp/immutable-repo.XXXXXX)
+    git clone --depth=1 "$repo" "$work"
+    if [[ -x "$work/install.sh" ]]; then
+        echo "==> Running install.sh from $repo"
+        (cd "$work" && ./install.sh)
+    else
+        echo "WARNING: no executable install.sh in $repo — skipping" >&2
+    fi
+    rm -rf "$work"
+done <<< "${_IMMUTABLE_REPOS:-}"
+
+INNER
+fi
+
+# Unmount boot/EFI before snapshotting
+umount -R "${STAGING_PATH}${BOOT_PARTITION}" 2>/dev/null || true
+
+if [[ $NSPAWN_RC -ne 0 ]]; then
+    die "nspawn update failed (exit $NSPAWN_RC) — staging retained at ${STAGING_SUBVOL}"
+fi
+
+# ── Create new read-only snapshot from updated staging ───────────────
+NEW_SNAP="${SNAP_PATH}/${STAMP}"
+info "creating new read-only snapshot: $NEW_SNAP"
+btrfs subvolume snapshot -r "$STAGING_PATH" "$NEW_SNAP" \
+    || die "failed to create new read-only snapshot"
+
+# Delete the staging subvolume
+btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
+info "staging subvolume removed"
+
+# ── Prune old snapshots ─────────────────────────────────────────────
+if [[ "${MAX_SNAPSHOTS:-0}" -gt 0 ]]; then
+    # Determine which snapshot we booted from so we don't prune it
+    BOOTED_SNAP=""
+    BOOTED_SUBVOL=$(grep -o 'subvol=@snapshots/[^ ,]*' /proc/cmdline 2>/dev/null | head -1 | sed 's|subvol=@snapshots/||') || true
+    if [[ -n "$BOOTED_SUBVOL" ]]; then
+        BOOTED_SNAP="${SNAP_PATH}/${BOOTED_SUBVOL}"
+    fi
+
+    mapfile -t ALL_SNAPS < <(
+        for d in "${SNAP_PATH}"/*/; do
+            [[ -d "$d" ]] && btrfs property get "$d" ro 2>/dev/null | grep -q 'ro=true' && echo "$d"
+        done | sort
+    )
+    EXCESS=$(( ${#ALL_SNAPS[@]} - MAX_SNAPSHOTS ))
+    if [[ $EXCESS -gt 0 ]]; then
+        info "pruning $EXCESS old snapshot(s)"
+        for (( i=0; i<EXCESS; i++ )); do
+            snap="${ALL_SNAPS[$i]%/}"
+            # Don't delete the snapshot we booted from
+            if [[ "$snap" = "$BOOTED_SNAP" ]]; then
+                info "  skipping (currently booted): $snap"
+                continue
+            fi
+            info "  deleting: $snap"
+            btrfs subvolume delete "$snap" || warn "failed to prune $snap"
+        done
+    fi
+fi
+
+# ── Update GRUB to pick up the new snapshot ──────────────────────────
+# Mount @snapshots so 06_immutable can discover them
+SNAP_MOUNT="/.snapshots"
+BTRFS_DEV_FOR_MOUNT=$(findmnt -n -o SOURCE / | head -1)
+BTRFS_DEV_FOR_MOUNT="${BTRFS_DEV_FOR_MOUNT%%\[*}"
+mount -t btrfs -o subvol=@snapshots,noatime "$BTRFS_DEV_FOR_MOUNT" "$SNAP_MOUNT" 2>/dev/null || true
+info "regenerating GRUB configuration"
+update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+umount "$SNAP_MOUNT" 2>/dev/null || true
+
+info "=== immutable-update completed successfully ==="
+info "New snapshot ${STAMP} is ready. Reboot to apply."

@@ -1,0 +1,12 @@
+[Unit]
+Description=Immutable root update timer (every 4 hours)
+Documentation=file:///etc/immutable-update.conf
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=4h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

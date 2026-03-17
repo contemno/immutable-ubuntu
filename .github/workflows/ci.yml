@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Shellcheck scripts
+        run: |
+          shellcheck -s bash \
+            data/usr/sbin/immutable-update \
+            data/usr/sbin/immutable-ubuntu-setup \
+            data/usr/lib/dracut/modules.d/90immutable-ubuntu/module-setup.sh \
+            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-setup.sh \
+            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-generator \
+            data/etc/grub.d/06_immutable
+
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential dpkg-dev debhelper devscripts git
+
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Verify package contents
+        run: |
+          dpkg-deb -c ../immutable-ubuntu_*.deb
+          dpkg-deb -I ../immutable-ubuntu_*.deb

@@ -1,0 +1,21 @@
+[Unit]
+Description=Restore persistent machine-id after rollback
+DefaultDependencies=no
+Before=systemd-machine-id-commit.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+    BTRFS_DEV=$(findmnt -n -o SOURCE / | sed "s/\\[.*\\]//"); \
+    mkdir -p /run/machine-id-sv; \
+    mount -t btrfs -o subvol=@machine-id,noatime "$BTRFS_DEV" /run/machine-id-sv; \
+    if [ -f /run/machine-id-sv/machine-id ]; then \
+        cp /run/machine-id-sv/machine-id /etc/machine-id; \
+    fi; \
+    umount /run/machine-id-sv; \
+    rmdir /run/machine-id-sv'
+
+[Install]
+WantedBy=sysinit.target

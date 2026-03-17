@@ -1,0 +1,110 @@
+#!/bin/bash
+# /usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-generator
+#
+# systemd generator — runs early in initramfs before any .mount units.
+#
+# Generators receive three directory arguments:
+#   $1 = normal priority dir   (e.g. /run/systemd/generator)
+#   $2 = early  priority dir
+#   $3 = late   priority dir
+#
+# We write to $1 (normal), which is the standard location for
+# generator-created units.
+#
+# What this generator does:
+#   1. Checks /proc/cmdline for rd.immutable — exits if absent.
+#   2. Parses root= and rootflags= from /proc/cmdline.
+#   3. Creates immutable-ubuntu-setup.service that runs the btrfs
+#      snapshot logic BEFORE sysroot.mount.
+#   4. Creates a sysroot.mount.d drop-in that changes Options=
+#      to mount @rootfs instead of the read-only snapshot.
+
+NORMAL_DIR="$1"
+[ -z "$NORMAL_DIR" ] && exit 1
+
+# ── Parse /proc/cmdline ───────────────────────────────────────────────
+cmdline=$(< /proc/cmdline)
+
+# Gate: only act when rd.immutable is present
+case " $cmdline " in
+    *" rd.immutable "*|*" rd.immutable="*) ;;
+    *) exit 0 ;;
+esac
+
+# Extract root= value
+root_arg=""
+for arg in $cmdline; do
+    case "$arg" in
+        root=*) root_arg="${arg#root=}" ;;
+    esac
+done
+
+# Extract rootflags= value
+rootflags_arg=""
+for arg in $cmdline; do
+    case "$arg" in
+        rootflags=*) rootflags_arg="${arg#rootflags=}" ;;
+    esac
+done
+
+# Parse subvol= out of rootflags, collect remaining flags
+target=""
+other_flags=""
+OLDIFS="$IFS"; IFS=','
+for flag in $rootflags_arg; do
+    case "$flag" in
+        subvol=*) target="${flag#subvol=}" ;;
+        *)
+            if [ -n "$other_flags" ]; then
+                other_flags="${other_flags},${flag}"
+            else
+                other_flags="$flag"
+            fi
+            ;;
+    esac
+done
+IFS="$OLDIFS"
+
+[ -z "$target" ] && exit 0
+
+# Build @rootfs mount options
+if [ -n "$other_flags" ]; then
+    rootfs_opts="subvol=@rootfs,${other_flags}"
+else
+    rootfs_opts="subvol=@rootfs"
+fi
+
+# ── Create immutable-ubuntu-setup.service ───────────────────────────────
+# This service runs the btrfs snapshot work before sysroot.mount starts.
+cat > "${NORMAL_DIR}/immutable-ubuntu-setup.service" << EOF
+[Unit]
+Description=Immutable root: create writable @rootfs from snapshot
+DefaultDependencies=no
+Before=sysroot.mount
+After=cryptsetup.target
+After=systemd-udevd.service
+RequiresMountsFor=/run
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/immutable-ubuntu-setup.sh ${root_arg} ${target}
+EOF
+
+# Make sysroot.mount depend on our service
+mkdir -p "${NORMAL_DIR}/sysroot.mount.d"
+cat > "${NORMAL_DIR}/sysroot.mount.d/immutable-ubuntu.conf" << EOF
+[Unit]
+After=immutable-ubuntu-setup.service
+Requires=immutable-ubuntu-setup.service
+
+[Mount]
+Options=${rootfs_opts}
+EOF
+
+# Make sure the service is wanted
+mkdir -p "${NORMAL_DIR}/initrd.target.wants"
+ln -sf ../immutable-ubuntu-setup.service \
+    "${NORMAL_DIR}/initrd.target.wants/immutable-ubuntu-setup.service"
+
+exit 0
