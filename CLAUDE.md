@@ -33,7 +33,7 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
  │  @snapshots/    read-only snapshots (root.YYYYMMDDTHHMMSS)                                       │
  │  @home, @log, @apt-cache, @tmp, @spool, @crash, @containers, @flatpak,                           │
  │  @snap, @libvirt, @AccountsService, @gdm3, @bluetooth, @cups, @fwupd,                            │
- │  @netmanager, @machine-id                                                                        │
+ │  @netmanager, @machine-id, @swap                                                                 │
  │     └─ persistent subvolumes, mounted via fstab, survive reboots and rollbacks                   │
  └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
