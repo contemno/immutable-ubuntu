@@ -55,7 +55,7 @@ btrfs subvolume snapshot /target /target/@
 info "Phase 2: Creating persistent subvolumes"
 for sv in @home @snapshots @log @apt-cache @tmp @spool @crash \
           @containers @flatpak @snap @libvirt @AccountsService \
-          @gdm3 @bluetooth @cups @fwupd @netmanager @machine-id; do
+          @gdm3 @bluetooth @cups @fwupd @netmanager @machine-id @swap; do
     btrfs subvolume show "/target/$sv" >/dev/null 2>&1 || \
         btrfs subvolume create "/target/$sv"
 done
@@ -96,13 +96,13 @@ migrate_sv @netmanager  /etc/NetworkManager/system-connections
 # Machine-id
 [ -f "$T/etc/machine-id" ] && cp "$T/etc/machine-id" /target/@machine-id/machine-id
 
-# Ensure /.snapshots mount point exists inside @
+# Ensure mount points exist inside @
 mkdir -p "$T/.snapshots"
-
-# Swapfile
 mkdir -p "$T/swap"
-btrfs filesystem mkswapfile --size 4g "$T/swap/swapfile"
-info "  swapfile created: /swap/swapfile (4G)"
+
+# Swapfile (on persistent @swap subvolume, not inside @)
+btrfs filesystem mkswapfile --size 4g "/target/@swap/swapfile"
+info "  swapfile created: @swap/swapfile (4G)"
 
 # ══════════════════════════════════════════════════════════════════════
 # Phase 4: Generate /etc/fstab
@@ -152,6 +152,7 @@ UUID=${BTRFS_UUID}  /var/lib/bluetooth                       btrfs  subvol=@blue
 UUID=${BTRFS_UUID}  /var/lib/cups                            btrfs  subvol=@cups,${BTRFS_OPTS}          0  0
 UUID=${BTRFS_UUID}  /var/lib/fwupd                           btrfs  subvol=@fwupd,${BTRFS_OPTS}         0  0
 UUID=${BTRFS_UUID}  /etc/NetworkManager/system-connections   btrfs  subvol=@netmanager,${BTRFS_OPTS}    0  0
+UUID=${BTRFS_UUID}  /swap                                    btrfs  subvol=@swap,${BTRFS_OPTS}            0  0
 
 # --- Swap ---
 /swap/swapfile  none  swap  defaults  0  0
@@ -189,7 +190,7 @@ for item in /target/*; do
     case "$base" in
         @|@home|@snapshots|@log|@apt-cache|@tmp|@spool|@crash|\
         @containers|@flatpak|@snap|@libvirt|@AccountsService|\
-        @gdm3|@bluetooth|@cups|@fwupd|@netmanager|@machine-id)
+        @gdm3|@bluetooth|@cups|@fwupd|@netmanager|@machine-id|@swap)
             continue ;;
         *)
             if mountpoint -q "$item" 2>/dev/null; then
