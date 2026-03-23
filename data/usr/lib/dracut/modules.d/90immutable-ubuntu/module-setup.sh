@@ -1,5 +1,6 @@
 #!/bin/bash
 # /usr/lib/dracut/modules.d/90immutable-ubuntu/module-setup.sh
+# shellcheck disable=SC2154  # moddir and initdir are set by dracut
 
 check() {
     require_binaries btrfs || return 1

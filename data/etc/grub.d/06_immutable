@@ -39,7 +39,7 @@ if [ -n "$DM_NAME" ]; then
 fi
 
 # Current kernel and initrd
-KERNEL_REL=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+KERNEL_REL=$(find /boot -maxdepth 1 -name "vmlinuz-*" -printf '%f\n' 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tail -1)
 
 if [ -z "$KERNEL_REL" ] || [ ! -f "/boot/initrd.img-${KERNEL_REL}" ]; then
     echo "Warning: No kernel or initrd found in /boot" >&2
@@ -142,8 +142,9 @@ if [ -n "$SNAPSHOTS" ]; then
 
     for snap in $SNAPSHOTS; do
         # Extract timestamp from snapshot name (root.YYYYMMDDTHHMMSS)
-        TS=$(echo "$snap" | sed 's/root\.//')
+        TS="${snap#root.}"
         # Format for display: 2025-03-08 14:30:00
+        # shellcheck disable=SC2001
         DISPLAY_TS=$(echo "$TS" | sed 's/\(....\)\(..\)\(..\)T\(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')
 
         emit_entry \
